@@ -1,4 +1,4 @@
-# Autonomous UAV with AI-based Visual Servoing
+# Autonomous UAV with AI-based Visual Servoing for Target Tracking
 
 **Autonomous drone-to-drone tracking with a Parrot AR.Drone, using YOLOv8 detection and image-based visual servoing (IBVS) in MATLAB/Simulink.**
 
@@ -9,6 +9,8 @@
 ![Platform](https://img.shields.io/badge/Drone-Parrot%20AR.Drone-green)
 
 A Parrot AR.Drone detects, confirms and follows another drone (the *target*) using only its front camera. A single-class (`UAV`) YOLOv8 network provides the target's position in the image, and a Simulink visual-servoing control law generates the flight commands in real time over Wi-Fi.
+
+🎓 This repository contains the code developed for the Master's Thesis **"Experimental Implementation of an Autonomous UAV with AI-Based Visual Servoing"**, MSc in Aerospace Engineering, (IST) University of Lisbon, 2026.
 
 ---
 
@@ -22,7 +24,7 @@ A Parrot AR.Drone detects, confirms and follows another drone (the *target*) usi
 
 ### Yaw and altitude control
 
-![Yaw and altitude control demo](assets/yaw_altitude.gif)
+![Yaw and altitude control demo](Files%20demonstration/yaw_altitude.gif)
 
 > Full video (1080p, ~35 s): [`Yaw & Altitude.mov`](<Videos demosnstration/Yaw & Altitude.mov>)
 
@@ -216,3 +218,5 @@ Both are **single-class (`UAV`)** detectors, provided in PyTorch (`.pt`) and ONN
 ## Author
 
 **David Ribeiro Sanjorge** — [@davribsan](https://github.com/davribsan)
+
+Master's Thesis: *"Experimental Implementation of an Autonomous UAV with AI-Based Visual Servoing"*, (IST) University of Lisbon, 2026.
