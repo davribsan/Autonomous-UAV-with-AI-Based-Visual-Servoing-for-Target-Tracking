@@ -36,7 +36,6 @@ A Parrot AR.Drone detects, confirms and follows another drone (the *target*) usi
 - **Asynchronous inference** using `parfeval` on a parallel pool, so the Simulink control loop (Ts = 0.03 s) never blocks waiting for the network.
 - **Target confirmation** before tracking starts, and **false-positive rejection** (implausible position or size jumps).
 - **Image-based visual servoing (IBVS)**: the normalized image error `s` and the bounding-box width `bw` feed the yaw, altitude and forward controllers.
-- **No Kalman filter**: the control signal comes only from real detections, holding the last valid value (*zero-order hold*) between detections.
 - **Decoupled video streaming**: a Python script captures the drone's video and hands frames to MATLAB through a double buffer with atomic writes.
 
 ---
@@ -88,7 +87,7 @@ flowchart LR
     └── Functions/
         ├── setupHover.m                       # Initializes and opens the Simulink model
         ├── DroneStream_tracking_init.m        # InitFcn: launches Python, loads models, creates the pool
-        ├── computer_vision_sfun_no_kalman.m   # Vision S-Function (version in use, no Kalman)
+        ├── computer_vision_sfun.m             # Vision S-Function 
         ├── yoloTrackingWorker.m               # Worker that runs inference
         ├── detectYOLOv8.m / importYOLOv8Model.m
         └── drone_stream.py                    # Drone video capture
@@ -163,7 +162,7 @@ The following values are hard-coded and **must be adapted to your machine**:
 
 ### Tracker parameters
 
-Defined in `computer_vision_sfun_no_kalman.m`:
+Defined in `computer_vision_sfun.m`:
 
 | Parameter | Value | Meaning |
 |---|---|---|
