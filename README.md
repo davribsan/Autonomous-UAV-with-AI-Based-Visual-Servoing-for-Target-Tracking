@@ -16,7 +16,7 @@ A Parrot AR.Drone detects, confirms and follows another drone (the *target*) usi
 
 ### Full tracking performance
 
-![Full tracking demo](Files demonstration/complete_performance.gif)
+![Full tracking demo](Files%20demonstration/complete_performance.gif)
 
 > Full video (1080p, ~27 s): [`Complete performance.mov`](<Videos demosnstration/Complete performance.mov>)
 
