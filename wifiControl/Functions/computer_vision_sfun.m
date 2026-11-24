@@ -1,10 +1,10 @@
-
 function computer_vision_sfun(block)
-% COMPUTER_VISION_SFUN  Level-2 MATLAB S-Function for drone tracking.
+% COMPUTER_VISION_SFUN_NO_KALMAN  Level-2 MATLAB S-Function for drone tracking.
+% Sin Kalman: s solo sale de detecciones YOLO reales, nunca de una prediccion.
+%
 % Outputs:
-%   1 – s        : normalised [x, y] image error for IBVS  [1x2 double]
-%   2 – bw       : bbox width in pixels                     [scalar double]
-%   3 – isValid  : 1 = fresh detection this tick, 0 = ZOH/lost [scalar double]
+%   1 - s        : normalised [x, y] image error for IBVS      [1x2 double]
+%   2 - bw       : bbox width in pixels                        [scalar double]
 setup(block);
 end
 
@@ -12,7 +12,7 @@ end
 function setup(block)
 
     block.NumInputPorts  = 0;
-    block.NumOutputPorts = 3;
+    block.NumOutputPorts = 2;
 
     % Output 1: s [1x2]
     block.OutputPort(1).Dimensions = [1 2];
@@ -23,11 +23,6 @@ function setup(block)
     block.OutputPort(2).Dimensions = 1;
     block.OutputPort(2).DatatypeID = 0;
     block.OutputPort(2).Complexity = 'Real';
-
-    % Output 3: isValid (scalar, 1 = fresh detection this tick, 0 = ZOH/lost)
-    block.OutputPort(3).Dimensions = 1;
-    block.OutputPort(3).DatatypeID = 0;
-    block.OutputPort(3).Complexity = 'Real';
 
     block.SampleTimes = [0.03 0];
 
@@ -50,21 +45,15 @@ function Start(block) %#ok<INUSD>
     ud.jpgB                = evalin('base','jpgB');
     ud.slotFile            = evalin('base','slotFile');
 
-    % Tracker state
-    ud.kf                  = [];
-    ud.kfInitialized       = false;
+    % Tracker state (sin Kalman)
     ud.isTracking          = false;
     ud.isConfirming        = false;
     ud.missCount           = 0;
     ud.confirmCount        = 0;
-    ud.predFrameCount      = 0;
     ud.lastBboxes          = [];
-    ud.lastCenter          = [];
-    ud.lastPredBbox        = [];
     ud.lastRejectedCenter  = [];
     ud.confirmCenter       = [];
     ud.futureInference     = [];
-    ud.adaptiveQ           = 200;
     ud.targetLost          = false;
 
     % Crop-to-frame mapping
@@ -82,11 +71,7 @@ function Start(block) %#ok<INUSD>
     ud.isTrackingInference = false;
     ud.inferenceStartTime  = [];
 
-    % dt tracking
-    ud.tPrev               = 0;
-    ud.tLastDetection      = 0;   % time of last real detection (not sim tick)
-
-    % Last valid s/bw (Zero-Order Hold between detections)
+    % Last valid s/bw (Zero-Order Hold entre detecciones)
     ud.lastS               = [0, 0];
     ud.lastBw              = 0;
 
@@ -97,26 +82,35 @@ end
 function Outputs(block)
 
     ud = evalin('base','cvsfun_state');
-    t  = block.CurrentTime;
 
     % Algorithm constants
-    maxMisses             = 3;
+    maxMisses             = 1;
     imageSizeTracking     = 320;
     minConfirmCount       = 2;
-    minConfirmScore       = 0.55;
+    minConfirmScore       = 0.3;
     maxConfirmDrift       = imageSizeTracking * 0.5;
-    maxStaleWhileTracking = 10;   % ticks ~450ms without frame → reset
+    maxStaleWhileTracking = 10;   % ticks ~450ms sin frame -> reset
+    maxTrackJump          = imageSizeTracking * 0.4; % salto max aceptado sin prediccion
 
     % Camera intrinsics
-    fu    = 567;
-    fv    = 566;
-    alpha = 0.0587;
-    Cu    = 330.7;
-    Cv    = 191.3;
+    Dron = 1;
+    if Dron==3
+        fu    = 566.35; %562.88
+        fv    = 564.89; % 560.74
+        Cu    = 330.2733; %332.33
+        Cv    = 184.9;    % 163.94
+    elseif Dron==1
+        fu    = 562.88;
+        fv    = 560.74;
+        Cu    = 332.33;
+        Cv    = 184.9;   
+    end
+    alpha = fv/fu;
+
 
     % Default outputs
-    s       = [0, 0];
-    bw      = 0;
+    s  = [0, 0];
+    bw = 0;
 
     % ── 7.1  Read next frame ─────────────────────────────────────────────
     frame = [];
@@ -143,21 +137,15 @@ function Outputs(block)
     if isempty(frame)
         ud.staleCount = ud.staleCount + 1;
 
-        % Stale-while-tracking guard: drone moved too fast, target lost
         if ud.isTracking && ud.staleCount >= maxStaleWhileTracking
             disp('[SFUN] No new frame while tracking — resetting tracker.')
             ud.isTracking         = false;
             ud.isConfirming       = false;
-            ud.kfInitialized      = false;
             ud.missCount          = 0;
             ud.confirmCount       = 0;
-            ud.predFrameCount     = 0;
             ud.lastBboxes         = [];
-            ud.lastCenter         = [];
-            ud.lastPredBbox       = [];
             ud.lastRejectedCenter = [];
             ud.confirmCenter      = [];
-            ud.adaptiveQ          = 200;
             ud.targetLost         = true;
             ud.lastS              = [0, 0];
             ud.lastBw             = 0;
@@ -167,10 +155,8 @@ function Outputs(block)
             end
         end
 
-        % No new frame: output last valid s/bw with isValid=0
         block.OutputPort(1).Data = double(ud.lastS);
         block.OutputPort(2).Data = double(ud.lastBw);
-        block.OutputPort(3).Data = double(0);
         assignin('base','cvsfun_state', ud);
         return;
     else
@@ -178,49 +164,15 @@ function Outputs(block)
         ud.targetLost = false;
     end
 
-    % ── 7.2/7.3  Kalman prediction ────────────────────────────────────────
     bboxes = [];
 
-    if ud.isTracking && ~ud.isConfirming && ud.kfInitialized && ...
-            ~isempty(ud.lastBboxes) && ~isempty(ud.futureInference)
-        kfPred = predict(ud.kf);
-        w = ud.lastBboxes(3);  h = ud.lastBboxes(4);
-        bboxes = [kfPred(1)-w/2, kfPred(3)-h/2, w, h];
-    end
-
-    if ud.isTracking && ud.isConfirming && ~isempty(ud.lastBboxes)
-        bboxes = ud.lastBboxes;
-    end
-
-    if ~ud.isTracking && ud.kfInitialized && ~isempty(ud.lastBboxes) && ~isempty(ud.futureInference)
-        if ud.predFrameCount < 10
-            kfPred            = predict(ud.kf);
-            w = ud.lastBboxes(3);  h = ud.lastBboxes(4);
-            bboxes            = [kfPred(1)-w/2, kfPred(3)-h/2, w, h];
-            ud.lastPredBbox   = bboxes;
-            ud.predFrameCount = ud.predFrameCount + 1;
-        else
-            bboxes = ud.lastPredBbox;
-        end
-    end
-
-    % ── 7.4  Launch async YOLO inference ─────────────────────────────────
+    % ── 7.2  Launch async YOLO inference ─────────────────────────────────
     if isempty(ud.futureInference)
 
         if ud.isTracking && ~isempty(ud.lastBboxes)
-            % Tracking crop
-            if ud.kfInitialized && ~ud.isConfirming
-                state    = ud.kf.State;
-                xc = state(1);  yc = state(3);
-                xcLast   = ud.lastBboxes(1) + ud.lastBboxes(3)/2;
-                ycLast   = ud.lastBboxes(2) + ud.lastBboxes(4)/2;
-                maxDrift = imageSizeTracking * 0.5;
-                xc = xcLast + max(-maxDrift, min(maxDrift, xc-xcLast));
-                yc = ycLast + max(-maxDrift, min(maxDrift, yc-ycLast));
-            else
-                xc = ud.lastBboxes(1) + ud.lastBboxes(3)/2;
-                yc = ud.lastBboxes(2) + ud.lastBboxes(4)/2;
-            end
+            % Tracking crop: centrado en la ULTIMA deteccion real, sin prediccion
+            xc = ud.lastBboxes(1) + ud.lastBboxes(3)/2;
+            yc = ud.lastBboxes(2) + ud.lastBboxes(4)/2;
 
             x1 = round(xc - imageSizeTracking/2);
             y1 = round(yc - imageSizeTracking/2);
@@ -252,7 +204,7 @@ function Outputs(block)
             ud.isTrackingInference = true;
 
         else
-            % Detection: full frame
+            % Deteccion: frame completo
             ud.futureInference     = parfeval(ud.pool, @yoloTrackingWorker, 3, ...
                                               frame, ud.modelPathDetection, ud.inputShapeDetection, 'detection');
             ud.inferenceStartTime  = tic;
@@ -260,8 +212,8 @@ function Outputs(block)
         end
     end
 
-    % ── 7.5  Collect YOLO results ─────────────────────────────────────────
-    freshDetection = false;   % true only when a real detection arrives this tick
+    % ── 7.3  Collect YOLO results ─────────────────────────────────────────
+    freshDetection = false;   % true SOLO si llega una deteccion real este tick
 
     if ~isempty(ud.futureInference) && strcmp(ud.futureInference.State,'finished')
 
@@ -285,7 +237,6 @@ function Outputs(block)
         % ── Tracking branch ───────────────────────────────────────────────
         if ud.isTracking
 
-            % Sanity check: reject implausible jumps / size changes
             if ~isempty(bboxesTmp)
                 bboxesRaw      = bboxesTmp;
                 bboxesRaw(:,1) = bboxesTmp(:,1)*ud.sentScaleX + ud.sentX1 - 1;
@@ -296,16 +247,15 @@ function Outputs(block)
                 xcRaw = bboxesRaw(1,1) + bboxesRaw(1,3)/2;
                 ycRaw = bboxesRaw(1,2) + bboxesRaw(1,4)/2;
 
+                % Rechazo de saltos implausibles (sin gracia de Kalman, umbral fijo)
                 if ~isempty(ud.lastBboxes)
                     xcLast    = ud.lastBboxes(1) + ud.lastBboxes(3)/2;
                     ycLast    = ud.lastBboxes(2) + ud.lastBboxes(4)/2;
                     distTrack = norm([xcRaw-xcLast, ycRaw-ycLast]);
                     wRatio    = bboxesRaw(1,3) / max(ud.lastBboxes(3), 1e-3);
                     hRatio    = bboxesRaw(1,4) / max(ud.lastBboxes(4), 1e-3);
-                    sizeJumpOk  = wRatio > 0.4 && wRatio < 2.5 && hRatio > 0.4 && hRatio < 2.5;
-                    missGrowth  = 1 + 0.5 * ud.missCount;
-                    maxTrackJump = imageSizeTracking * 0.6 * missGrowth;
-                    isFarJump   = distTrack > maxTrackJump;
+                    sizeJumpOk = wRatio > 0.4 && wRatio < 2.5 && hRatio > 0.4 && hRatio < 2.5;
+                    isFarJump  = distTrack > maxTrackJump;
 
                     reappeared = false;
                     if isFarJump && ~isempty(ud.lastRejectedCenter)
@@ -358,12 +308,6 @@ function Outputs(block)
                             disp('Target confirmed. Starting tracking...')
                             ud.isConfirming  = false;
                             ud.confirmCenter = [];
-                            ud.kf = trackingKF('MotionModel','2D Constant Velocity', ...
-                                               'State',[xc;0;yc;0], ...
-                                               'MeasurementNoise',10, ...
-                                               'ProcessNoise',ud.adaptiveQ);
-                            ud.kfInitialized = true;
-                            ud.lastCenter    = [xc, yc];
                             freshDetection   = true;
                         end
                     else
@@ -374,38 +318,11 @@ function Outputs(block)
                         ud.targetLost    = true;
                     end
                 else
-                    if ~ud.kfInitialized
-                        ud.kf = trackingKF('MotionModel','2D Constant Velocity', ...
-                                           'State',[xc;0;yc;0], ...
-                                           'MeasurementNoise',10, ...
-                                           'ProcessNoise',ud.adaptiveQ);
-                        ud.kfInitialized = true;
-                        ud.lastCenter    = [xc, yc];
-                    else
-                        if ~isempty(ud.lastCenter)
-                            dt_det = t - ud.tLastDetection;
-                            if dt_det <= 0,  dt_det = 0.1;  end
-                            accel = norm([xc,yc] - ud.lastCenter) / dt_det;
-                            if     accel > 70,  ud.adaptiveQ = 300;  ud.kf.MeasurementNoise = 5;
-                            elseif accel > 15,  ud.adaptiveQ = 200;  ud.kf.MeasurementNoise = 10;
-                            else,               ud.adaptiveQ = 50;   ud.kf.MeasurementNoise = 20;
-                            end
-                            ud.kf.ProcessNoise = ud.adaptiveQ;
-                        end
-                        ud.lastCenter     = [xc, yc];
-                        ud.tLastDetection = t;
-                        correct(ud.kf, [xc, yc]);
-                    end
+                    % Deteccion real confirmada este tick: no hay prediccion previa
                     freshDetection = true;
-
-                    state  = ud.kf.State;
-                    bboxes = [state(1)-ud.lastBboxes(3)/2, state(3)-ud.lastBboxes(4)/2, ...
-                              ud.lastBboxes(3), ud.lastBboxes(4)];
                 end
 
-                ud.missCount      = 0;
-                ud.predFrameCount = 0;
-                ud.lastPredBbox   = [];
+                ud.missCount = 0;
 
             else
                 ud.missCount = ud.missCount + 1;
@@ -421,9 +338,9 @@ function Outputs(block)
                     if ud.missCount >= maxMisses
                         disp('Target lost. Switching to detection...')
                         ud.isTracking         = false;
-                        ud.missCount          = 0;    ud.predFrameCount     = 0;
-                        ud.confirmCount       = 0;    ud.lastCenter         = [];
-                        ud.adaptiveQ          = 200;  ud.lastRejectedCenter = [];
+                        ud.missCount          = 0;
+                        ud.confirmCount       = 0;
+                        ud.lastRejectedCenter = [];
                         bboxes                = [];
                         ud.targetLost         = true;
                     end
@@ -436,84 +353,47 @@ function Outputs(block)
                 xcDet = bboxesTmp(1,1) + bboxesTmp(1,3)/2;
                 ycDet = bboxesTmp(1,2) + bboxesTmp(1,4)/2;
 
-                detValid = true;
-                if ~isempty(ud.lastBboxes)
-                    xcLast = ud.lastBboxes(1) + ud.lastBboxes(3)/2;
-                    ycLast = ud.lastBboxes(2) + ud.lastBboxes(4)/2;
-                    if norm([xcDet-xcLast, ycDet-ycLast]) > imageSizeTracking * 2.0
-                        disp('Warning: false positive rejected')
-                        detValid        = false;
-                        ud.confirmCount = 0;
-                        bboxes          = ud.lastPredBbox;
-                    end
-                end
-
-                if detValid
-                    disp('Target detected. Waiting for confirmation...')
-                    ud.lastBboxes    = double(bboxesTmp(1,:));
-                    bboxes           = double(bboxesTmp);
-                    ud.isTracking    = true;
-                    ud.isConfirming  = true;
-                    ud.confirmCount  = 1;
-                    ud.confirmCenter = [xcDet, ycDet];
-                    ud.missCount     = 0;  ud.predFrameCount = 0;
-                    ud.lastPredBbox  = [];
-                    ud.targetLost    = false;
-                end
-            else
-                ud.confirmCount = 0;
-                if ud.kfInitialized
-                    ud.missCount = ud.missCount + 1;
-                    if ud.missCount >= maxMisses * 3
-                        disp('No target found. Resetting tracker...')
-                        ud.kfInitialized  = false;
-                        ud.lastBboxes     = [];  ud.lastPredBbox = [];
-                        bboxes            = [];  ud.missCount    = 0;
-                        ud.predFrameCount = 0;   ud.lastCenter   = [];
-                        ud.adaptiveQ      = 200;
-                        ud.targetLost     = true;
-                    end
-                end
+                disp('Target detected. Waiting for confirmation...')
+                ud.lastBboxes    = double(bboxesTmp(1,:));
+                bboxes           = double(bboxesTmp);
+                ud.isTracking    = true;
+                ud.isConfirming  = true;
+                ud.confirmCount  = 1;
+                ud.confirmCenter = [xcDet, ycDet];
+                ud.missCount     = 0;
+                ud.targetLost    = false;
             end
         end
     end
 
     % ── Compute s/bw from bbox ────────────────────────────────────────────
-    if ~isempty(bboxes) && size(bboxes,2) >= 4
+    if freshDetection && ~isempty(bboxes) && size(bboxes,2) >= 4
         u  = bboxes(1,1) + bboxes(1,3)/2;
         v  = bboxes(1,2) + bboxes(1,4)/2;
         bw = bboxes(1,3);
         s  = [(u-Cu)/(fu*alpha), (v-Cv)/fv];
     end
 
-    % ── isValid and Zero-Order Hold ───────────────────────────────────────
-    % isValid=1 only when there is a fresh real detection this tick
-    % (not a KF prediction, not confirming, not stale, not lost).
-    % When isValid=0, output the last valid s/bw (ZOH) so the IBVS
-    % has a smooth signal — but the caller should gate its output
-    % using isValid to avoid acting on stale data during fast motion.
+    % ── isValid ──────────────────────────────────────────────────────────
+    % En cualquier otro caso (esperando inferencia, target perdido,
+    % confirmando)se mantiene el ultimo s conocido (ZOH),
     if ud.targetLost
-        % Tracker definitively lost the target → send zeros, not stale pos
         s       = [0, 0];
         bw      = 0;
-        isValid = 0;
         ud.lastS  = s;
         ud.lastBw = bw;
-    elseif freshDetection
-        % Real detection confirmed this tick
-        isValid   = 1;
-        ud.lastS  = s;
-        ud.lastBw = bw;
-    else
-        % KF prediction or waiting for inference → ZOH
-        s       = ud.lastS;
-        bw      = ud.lastBw;
-        isValid = 0;
+    else 
+        if freshDetection
+            ud.lastS  = s;
+            ud.lastBw = bw;
+        else
+            s       = ud.lastS;
+            bw      = ud.lastBw;
+        end
     end
 
     block.OutputPort(1).Data = double(s);
     block.OutputPort(2).Data = double(bw);
-    block.OutputPort(3).Data = double(isValid);
 
     assignin('base','cvsfun_state', ud);
 end
